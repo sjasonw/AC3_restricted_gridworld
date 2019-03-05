@@ -93,21 +93,19 @@ def probe():
 
 if __name__ == "__main__":
     import pickle
+    import random
+    #
+    # def starting_epsilon(level):
+    #     """Outputs the initial value of epsilon to use at each episode"""
+    #     if level == 1:
+    #         return 1.
+    #     elif level <= 7:
+    #         return .5
+    #     else:
+    #         return .2
 
-    def starting_epsilon(level):
-        """Outputs the initial value of epsilon to use at each episode"""
-        if level == 1:
-            return 1.
-        elif level <= 7:
-            return .5
-        else:
-            return .2
-
-    notes = "self.optimizer = optim.RMSprop(self.value_net.parameters(),\n" \
-            " lr=5e-6, momentum=.99, timeout at 75 steps.  9 levels of mazes.\n" \
-            "new rewards: exit 1., step -.01, crash -.02, timeout -.02\n" \
-            "discount .99\n" \
-            "using a 2 layer RNN (60 hidden) but 2 layer fc afterwards \n"
+    notes = "lr = 2e-12 ADAM, (.5, .999) , 40 field features, no temporal_convolution, batch_size 30, 300 -> 50 hidden\n" \
+            "policy gradient on with lr = 2e-8 ADAM, (.5, .999)"
 
     print("gathering maze data... ", end="")
     mazes = []
@@ -117,7 +115,7 @@ if __name__ == "__main__":
             maze_group = pickle.load(f)
 
         for maze in maze_group:
-            maze.exit_reward = 1.
+            maze.exit_reward = 5.
             maze.step_reward = -.1
             maze.crash_reward = -.2
             maze.timeout_reward = maze.crash_reward
@@ -126,43 +124,48 @@ if __name__ == "__main__":
     print("done")
 
     total_mazes = 10000
-    for i in range(9):
+    for i in range(1):
         assert len(mazes[i]) == total_mazes
-    ep_limit = 20
-    short_cap = 100
-    num_learning_steps = 100
+    ag = agent.Agent(5, discount=.95,mem_len=1000)
+    episodes_per_group = 10
+    num_learning_steps = 1000
 
-    ag_1 =agent.Agent(5,1.,ep_limit,short_cap,blur=.05)
+
 
     for level in range(1,10):
         print("\n\n*** Starting level ", level, " ***\n")
         maze_pos = 0
         counter = 0
-        while counter <= 4 * total_mazes:
-            epsilon = min(
-                starting_epsilon(level), math.exp(-counter / total_mazes)
-            )
-            success_count = 0
+        while counter <= total_mazes:
+
+            epsilon = min(.5, math.exp(-2*counter / total_mazes))
+
             print(notes)
             print("level, maze number, counter, epsilon:",
                   level, maze_pos, counter, epsilon, sep="   ")
-            for maze in mazes[level-1][maze_pos: maze_pos + ep_limit]:
-                ag_1.set_environment(maze)
-                s1 = ag_1.step_counter
-                ag_1.e_greedy_episode(epsilon=epsilon, reset=True)
-                s2 = ag_1.step_counter
-                success_count += int(s2 - s1 < maze.timeout_steps - 1)  # TODO the -1 is there for lazy safety...
+            init_steps = ag.step_counter
+            for maze in mazes[level-1][maze_pos: maze_pos + episodes_per_group]:
+                ag.set_environment(maze)
+                rew = ag.e_greedy_episode(epsilon=epsilon,policy_grad=True)
+                normal_steps = rew.count(-.1)
+                crashes = rew.count(-.2)
+                escape = rew.count(5.)
+                print("crash / step / escape\n", crashes, normal_steps, escape)
 
-            # only decrease epsilon if the agent is still winning mazes reasonably well
-            if success_count > (ep_limit / 2)*(1-epsilon):
-                counter += 2 * ep_limit # 2 increases counter growth rate
+            steps = ag.step_counter - init_steps
 
-            maze_pos = (maze_pos + ep_limit) % total_mazes
+            counter += episodes_per_group
+            maze_pos = (maze_pos + episodes_per_group) % total_mazes
             print("learning phase starting")
-            for _ in range(num_learning_steps):
-                ag_1.recall_study(batch_size=5, backup=1)
+            #  We base the number of training steps off the number of
+            #  steps during that last group of episodes.  This helps to
+            #  train to the size of the data set
+            for _ in range(steps):
+                # if random.random()< .0001:
+                #     print(notes)
+                ag.recall_study(batch_size=30, allow_batch_reduction=False)
 
-            ag_1.update_target_net()
+            ag.update_target_net()
 
         print("\nGraduated!!\n")
 

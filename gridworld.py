@@ -27,7 +27,7 @@ class BoxGame(object):
                  watch_construction=False,
                  max_tree_steps=1000,
                  bias=None,
-                 pad_size=1,
+                 pad_size=5,
                  instant_death_p=None,
                  timeout_steps=None):
 
