@@ -8,6 +8,224 @@ import torch.nn as nn
 import tools
 
 
+class ActorCriticNet1F(nn.Module):
+    """
+    Network input
+    _____________
+    frames : torch tensor
+        size (temporal_dim, 11, 11)
+    field : torch tensor
+        size (field_ch, 28, 28)
+    mode : str
+        The value of mode must be either "actor" or "critic".  When
+        mode is "actor" the return is a tuple (dist, log_pol_move)
+        where dist is a torch.distribution.Normal object for
+        writing to the field, and log_pol_move is the log of
+        the probabilities of taking the four movement actions.
+    """
+
+    def __init__(self, field_ch, temporal_frames, num_hidden=100):
+        super(ActorCriticNet1F, self).__init__()
+        self.num_hidden = num_hidden
+
+        field_ft = 20 * 4 * 4
+        temp_ft = 10 * 4 * 4
+        last_frame_ft = 2 * 11 * 11
+
+        num_total_ft = field_ft + temp_ft + last_frame_ft
+
+        # 28 x 28 -> 4 x 4
+        self.field_conv = nn.Sequential(
+            nn.Conv2d(field_ch, 10, 5),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(10, 20, 5),
+            nn.ReLU(),
+            nn.MaxPool2d(2)
+        )
+
+        self.temporal_conv = nn.Sequential(
+            # (ch=2, num_frames, 11, 11) -> (ch=10, 1, 8, 8)
+            nn.Conv3d(2, 10, kernel_size=(temporal_frames, 4, 4)),
+            nn.ReLU(),
+            # (ch=10, 1, 8, 8) -> (ch=10, 1 , 4, 4)
+            nn.MaxPool3d(kernel_size=(1, 2, 2))
+        )
+
+        self.processing = nn.Sequential(
+            nn.Linear(num_total_ft, num_hidden),
+            nn.ReLU(),
+            nn.Dropout(p=.3),
+            nn.Linear(num_hidden, num_hidden),
+            nn.ReLU()
+        )
+
+        self.critic = nn.Linear(num_hidden, 1)
+        self.log_pol_move = nn.Sequential(
+            nn.Linear(num_hidden, 4),
+            nn.Dropout(), # TODO this is a test feature
+            nn.LogSoftmax(dim=0)
+        )
+        self.mean_generator = nn.Sequential(
+            # square image dimension: 1
+            nn.ConvTranspose2d(num_hidden, 16,
+                               kernel_size=4, stride=1, bias=False),
+            nn.ReLU(),
+            #nn.BatchNorm2d(field_ch * 64),
+            # square image dimension: 4
+            nn.ConvTranspose2d(16, 8,
+                               kernel_size=4, stride=2, bias=False),
+            nn.ReLU(),
+            #nn.BatchNorm2d(field_ch * 32),
+            # square image dimension: 10
+            nn.ConvTranspose2d(8, 4,
+                               kernel_size=4, stride=1, bias=False),
+            nn.ReLU(),
+            #nn.BatchNorm2d(field_ch * 16),
+            # square image dimension: 13
+            nn.ConvTranspose2d(4, field_ch,
+                               kernel_size=4, stride=2, bias=False),
+            # square image dimension: 28
+            nn.Tanh()
+        )
+
+        self.sd_generator = nn.Sequential(
+            # square image dimension: 1
+            nn.ConvTranspose2d(num_hidden, 16,
+                               kernel_size=4, stride=1, bias=False),
+            nn.ReLU(),
+            #nn.BatchNorm2d(field_ch * 64),
+            # square image dimension: 4
+            nn.ConvTranspose2d(16, 8,
+                               kernel_size=4, stride=2, bias=False),
+            nn.ReLU(),
+            #nn.BatchNorm2d(field_ch * 32),
+            # square image dimension: 10
+            nn.ConvTranspose2d(8, 4,
+                               kernel_size=4, stride=1, bias=False),
+            nn.ReLU(),
+            #nn.BatchNorm2d(field_ch * 16),
+            # square image dimension: 13
+            nn.ConvTranspose2d(4, field_ch,
+                               kernel_size=4, stride=2, bias=False),
+            # square image dimension: 28
+            nn.Sigmoid()
+        )
+
+        discriminator_in_ft = last_frame_ft + field_ft
+        self.discriminator_end = nn.Sequential(
+            nn.Linear(discriminator_in_ft, num_hidden),
+            nn.ReLU(),
+            nn.Dropout(p=.3),
+            nn.Linear(num_hidden, num_hidden//2),
+            nn.ReLU(),
+            nn.Dropout(p=.3),
+            nn.Linear(num_hidden//2, 1),
+            nn.LogSigmoid()
+        )
+
+    def forward(self, frames, field, mode: str):
+
+        if mode == "test_memory":
+            # In this mode, field must be a batch.
+            field_ft = self.field_conv(field)
+            field_ft = field_ft.view(-1, tools.num_flat_features(field_ft))
+            frames = frames.view(-1, tools.num_flat_features(frames))
+            discriminator_input = torch.cat((field_ft, frames), dim=1)
+            return self.discriminator_end(discriminator_input)
+
+
+        field_ft = self.field_conv(field.unsqueeze(0))
+        field_ft = field_ft.flatten()
+
+        reshaped = frames.transpose(0, 1).unsqueeze(0)
+        temp_frame_ft = self.temporal_conv(reshaped)
+        temp_frame_ft = temp_frame_ft.flatten()
+
+        last_frame = frames[-1].flatten()
+
+        processing_input = torch.cat((field_ft, temp_frame_ft, last_frame))
+        out = self.processing(processing_input)
+
+        if mode == "critic":
+            return self.critic(out)
+        elif mode == "move":
+            log_pol_move = self.log_pol_move(out)
+            return log_pol_move
+        elif mode == "write":
+            mean = self.mean_generator(out.view(1, self.num_hidden, 1, 1))
+            sd = self.sd_generator(out.view(1, self.num_hidden, 1, 1))
+            mean = mean.squeeze(dim=0)
+            sd = sd.squeeze(dim=0)
+            dist = torch.distributions.Normal(loc=mean, scale=sd)
+            return dist
+        else:
+            raise ValueError("mode {0} not recognized".format(mode))
+
+
+
+
+
+class ActorCriticNoField(nn.Module):
+    """
+    A version of the actor critic network with no field reading or writing.
+    This is designed for testing AC3 code without the complication of
+    the internal memory field.
+    """
+
+    def __init__(self, field_ch, temporal_frames, num_hidden=100):
+        super(ActorCriticNoField, self).__init__()
+        self.num_hidden = num_hidden
+        temp_ft = 10 * 4 * 4
+        last_frame_ft = 2 * 11 * 11
+
+        num_total_ft = temp_ft + last_frame_ft
+
+
+        self.temporal_conv = nn.Sequential(
+            # (ch=2, num_frames, 11, 11) -> (ch=10, 1, 8, 8)
+            nn.Conv3d(2, 10, kernel_size=(temporal_frames, 4, 4)),
+            nn.ReLU(),
+            # (ch=10, 1, 8, 8) -> (ch=10, 1 , 4, 4)
+            nn.MaxPool3d(kernel_size=(1, 2, 2))
+        )
+
+        self.processing = nn.Sequential(
+            nn.Linear(num_total_ft, num_hidden),
+            nn.ReLU(),
+            nn.Dropout(p=.3),
+            nn.Linear(num_hidden, num_hidden),
+            nn.ReLU()
+        )
+
+        self.critic = nn.Linear(num_hidden, 1)
+        self.log_pol_move = nn.Sequential(
+            nn.Linear(num_hidden, 4),
+            nn.LogSoftmax(dim=0)
+        )
+
+    def forward(self, frames, mode: str):
+
+        reshaped = frames.transpose(0, 1).unsqueeze(0)
+        temp_frame_ft = self.temporal_conv(reshaped)
+        temp_frame_ft = temp_frame_ft.flatten()
+
+        last_frame = frames[-1].flatten()
+
+        processing_input = torch.cat((temp_frame_ft, last_frame))
+        out = self.processing(processing_input)
+
+        if mode == "critic":
+            return self.critic(out)
+        elif mode == "move":
+            log_pol_move = self.log_pol_move(out)
+            return log_pol_move
+        elif mode == "write":
+            raise ValueError("write mode is not available for this network.")
+        else:
+            raise ValueError("mode {0} not recognized".format(mode))
+
+
 # --------------------------------------------------------------------------
 # Sensory network with fixed parameters
 # --------------------------------------------------------------------------
@@ -40,7 +258,7 @@ class SensoryNetFixed(nn.Module):
             p.requires_grad = False
         key = {
             "exit": 2.,
-            "open": 1.,
+            "open": 0.,
             #"block": -1.,
             # "pit": -2.
         }
@@ -447,24 +665,13 @@ class InternalPolicy(nn.Module):
 if __name__ == '__main__':
     import numpy as np
     from time import time
+
     sens = SensoryNetFixed()
-    reader = ConvolutionalReader(field_channels=2,temporal_frames=4,ag_range=5)
-    val = ValueNet(agent_range=5,field_ch=2,num_hidden=40)
-
-    v = torch.ones(11, 11)
-    v2 = -1*torch.ones(11, 11)
-    v3 = 0*torch.ones(11, 11)
-    v4 = v
-
-    frames = torch.stack((v,v2,v3, v4))
+    ac = ActorCriticNet1F(2,3, num_hidden=100)
+    frames = torch.rand(7, 11, 11)
     frames = sens(frames)
-    frames = torch.stack((frames, frames))  # batch size = 2
-    print("frame size: ", frames.size())
-
-    internal = torch.rand(2,2,28,28)
-    t1 = time()
-    combined = reader(internal, frames)
-    out = val(combined)
+    field = torch.rand(7,2, 28, 28)
+    out = ac(frames, field, mode="test_memory")
 
 
     def print_num_params(model):
@@ -474,12 +681,8 @@ if __name__ == '__main__':
 
         print(params)
 
-    print_num_params(val)
+    print_num_params(ac)
 
-    print(out)
-
-    policy = InternalPolicy(5,field_ch=2)
-    policy(combined)
 
 
 

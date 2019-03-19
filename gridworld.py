@@ -118,8 +118,6 @@ class BoxGame(object):
         `terminal` is True if the agent has stepped onto an exit or pit,
          False otherwise.
         """
-
-
         if self.instant_death_p is not None:
             if np.random.random() < self.instant_death_p:
                 reward = self.instant_death_reward
@@ -511,94 +509,18 @@ def generate_mazes(num_gen, filename, size, pad_size, block_rate, num_exits,
 
 
 if __name__=="__main__":
-    print("level 1")
-    generate_mazes(10000, "level_1.dat",
-                   size=10,
-                   pad_size=5,
-                   block_rate=.2,
-                   num_exits=4,
-                   timeout_steps=75,
-                   max_gen_steps=200
-                   )
 
-    print("level 2")
-    generate_mazes(10000, "level_2.dat",
-                   size=12,
-                   pad_size=5,
-                   block_rate=.1,
-                   num_exits=3,
-                   timeout_steps=75,
-                   max_gen_steps=200
-                   )
 
-    print("level 3")
-    generate_mazes(10000, "level_3.dat",
-                   size=16,
+    print("")
+    generate_mazes(10000, "maze_3_17.dat",
+                   size=15,
                    pad_size=5,
-                   block_rate=.15,
-                   num_exits=3,
-                   timeout_steps=75,
-                   max_gen_steps=200
-                   )
-
-    print("level 4")
-    generate_mazes(10000, "level_4.dat",
-                   size=16,
-                   pad_size=5,
-                   block_rate=.2,
-                   num_exits=3,
-                   timeout_steps=75,
-                   max_gen_steps=200
-                   )
-
-    print("level 5")
-    generate_mazes(10000, "level_5.dat",
-                   size=16,
-                   pad_size=5,
-                   block_rate=.25,
-                   num_exits=3,
-                   timeout_steps=75,
-                   max_gen_steps=200
-                   )
-
-    print("level 6")
-    generate_mazes(10000, "level_6.dat",
-                   size=10,
-                   pad_size=5,
-                   block_rate=.15,
+                   block_rate=1.,
                    num_exits=1,
-                   timeout_steps=75,
-                   max_gen_steps=200
-                   )
-
-    print("level 7")
-    generate_mazes(10000, "level_7.dat",
-                   size=12,
-                   pad_size=5,
-                   block_rate=.17,
-                   num_exits=1,
-                   timeout_steps=75,
-                   max_gen_steps=200
-                   )
-
-    print("level 8")
-    generate_mazes(10000, "level_8.dat",
-                   size=12,
-                   pad_size=5,
-                   block_rate=.22,
-                   num_exits=1,
-                   timeout_steps=75,
-                   max_gen_steps=200
-                   )
-
-    print("level 9")
-    generate_mazes(10000, "level_9.dat",
-                   size=13,
-                   pad_size=5,
-                   block_rate=.24,
-                   num_exits=1,
-                   timeout_steps=75,
-                   max_gen_steps=200
+                   num_empty_targets=1,
+                   timeout_steps=750,
+                   generator_bias=.4,
+                   max_gen_steps=400
                    )
 
 
