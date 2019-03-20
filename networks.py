@@ -66,6 +66,9 @@ class ActorCriticNet1F(nn.Module):
             nn.Dropout(), # TODO this is a test feature
             nn.LogSoftmax(dim=0)
         )
+
+
+
         self.mean_generator = nn.Sequential(
             # square image dimension: 1
             nn.ConvTranspose2d(num_hidden, 16,
@@ -84,7 +87,7 @@ class ActorCriticNet1F(nn.Module):
             #nn.BatchNorm2d(field_ch * 16),
             # square image dimension: 13
             nn.ConvTranspose2d(4, field_ch,
-                               kernel_size=4, stride=2, bias=False),
+                               kernel_size=4, stride=2),
             # square image dimension: 28
             nn.Tanh()
         )
@@ -107,21 +110,15 @@ class ActorCriticNet1F(nn.Module):
             #nn.BatchNorm2d(field_ch * 16),
             # square image dimension: 13
             nn.ConvTranspose2d(4, field_ch,
-                               kernel_size=4, stride=2, bias=False),
+                               kernel_size=4, stride=2),
             # square image dimension: 28
             nn.Sigmoid()
         )
 
         discriminator_in_ft = last_frame_ft + field_ft
         self.discriminator_end = nn.Sequential(
-            nn.Linear(discriminator_in_ft, num_hidden),
-            nn.ReLU(),
-            nn.Dropout(p=.3),
-            nn.Linear(num_hidden, num_hidden//2),
-            nn.ReLU(),
-            nn.Dropout(p=.3),
-            nn.Linear(num_hidden//2, 1),
-            nn.LogSigmoid()
+            nn.Linear(discriminator_in_ft, 1),
+            nn.Sigmoid()
         )
 
     def forward(self, frames, field, mode: str):
@@ -157,6 +154,7 @@ class ActorCriticNet1F(nn.Module):
             sd = self.sd_generator(out.view(1, self.num_hidden, 1, 1))
             mean = mean.squeeze(dim=0)
             sd = sd.squeeze(dim=0)
+            sd = sd * 1e-9  # TODO: this is a short-term fix attempt
             dist = torch.distributions.Normal(loc=mean, scale=sd)
             return dist
         else:
@@ -670,7 +668,7 @@ if __name__ == '__main__':
     ac = ActorCriticNet1F(2,3, num_hidden=100)
     frames = torch.rand(7, 11, 11)
     frames = sens(frames)
-    field = torch.rand(7,2, 28, 28)
+    field = torch.rand(7,1, 28, 28)
     out = ac(frames, field, mode="test_memory")
 
 

@@ -31,7 +31,7 @@ def show_images(images, cols=1, titles=None):
         plt.imshow(image,cmap='Greys', vmin=-2.,vmax=2.)
         a.set_title(title)
     fig.set_size_inches(np.array(fig.get_size_inches()) * n_images/2)
-    plt.show()
+    plt.show(block=False)
     plt.pause(.001)
 
 

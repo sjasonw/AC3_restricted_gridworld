@@ -12,54 +12,26 @@ import networks
 import pickle
 from gridworld import BoxGame
 
-Params = namedtuple("Params",
-                    (
-                        "discount", "td_steps", "range", "field_ch",
-                        "temp_frames",
-                        "memory_coef", "global_t_max", "entropy_coef"))
 
-SharedQueues = namedtuple("SharedQueues",
-                          ("maze_queue", "param_queue", "glb_t_queue"))
-
-LevelRanges = namedtuple("LevelRanges",
-                         ("num_samples", "range_list"))
-
-
-class AC3Process(object):
-    def __init__(self,
-                 queues: SharedQueues,
-                 params: Params,
-                 level_ranges: LevelRanges = None):
-        if queues.maze_queue:
-            self.mode = "maze_queue"
-        elif level_ranges:
-            self.mode = "level_ranges"
-        else:
-            raise RuntimeError("Unable to determine maze gathering protocol.")
-
-        self.env_list = []
-        self.level_ranges = level_ranges
-
-        self.track = True
-
-        self.discount = params.discount
-        self.td_steps = params.td_steps
-        self.range = params.range
+class Agent(object):
+    def __init__(self, field_ch, num_temp_frames, ag_range, memory_coef,
+                 ac_state_dict=None):
+        # TODO: temp removal of field (change back the type of network)
+        self.field_ch = field_ch
+        self.num_temp_frames = num_temp_frames
+        self.range = ag_range
         assert self.range == 5, "Currently, range must be 5."
-        self.field_ch = params.field_ch
-        self.num_temp_frames = params.temp_frames
-        self.memory_coef = params.memory_coef
-        self.glb_t_max = params.global_t_max
-        self.entropy_coef = params.entropy_coef  # TODO implement entropy loss
+        self.memory_coef = memory_coef
+        self.preprocessor = networks.SensoryNetFixed()
 
-        self.maze_queue = queues.maze_queue
-        self.param_queue = queues.param_queue
-        self.glb_t_queue = queues.glb_t_queue
+        self.ac_net = networks.ActorCriticNet1F(self.field_ch,
+                                                  self.num_temp_frames)
+        if ac_state_dict:
+            self.ac_net.load_state_dict(ac_state_dict)
 
         self.environment = None
         width = 2 * self.range + 1
         self.view = torch.zeros((width, width))
-        self.view_loaded = False
         self.frames = None
         self.field_size = (self.field_ch, 28, 28)
         self.field = None
@@ -71,9 +43,207 @@ class AC3Process(object):
             np.array([1, 0])
         ]
 
-        self.preprocessor = networks.SensoryNetFixed()
-        self.ac_net = networks.ActorCriticNet1F(
-            self.field_ch, self.num_temp_frames)
+    def episode_run(self, env=None):
+        if env:
+            self.set_environment(env)
+        terminal = False
+        while not terminal:
+            (move, write) = self.pick_action()
+            _, terminal = self.show_move(move.item())
+            self.update_field(write)
+
+    def set_environment(self, env):
+        if self.environment:
+            self.environment.reset_grid()
+        self.environment = env
+        self.initialize_frames()
+        self.initialize_field()
+
+    def initialize_frames(self):
+        view = self.get_view()
+        view_stack = torch.stack([view for _ in range(self.num_temp_frames)])
+        self.frames = self.preprocessor(view_stack)
+
+    def initialize_field(self):
+        self.field = torch.zeros(self.field_size)
+
+    def get_view(self, noise_scale=.01):
+        # if self.view_loaded:
+        #    return self.view
+        self.view = self.environment.agent_view(self.range)
+        self.view += noise_scale * torch.randn(self.view.size())
+        return self.view
+
+    def move(self, move_index):
+        """
+        :param int move_index: an index for self.steps
+        :return: (float reward, bool terminal):
+        reward: the reward the environment returns after the action
+        terminal: True if the new state is terminal, False otherwise
+        """
+        # d
+        #
+        step = self.steps[move_index]
+        (reward, terminal) = self.environment.move_agent(step)
+        view = self.get_view()
+        frame = self.preprocessor(view.unsqueeze(0))
+        self.frames = torch.cat((self.frames[1:], frame))
+        return reward, terminal
+
+    def update_field(self, change):
+        self.field = self.memory_coef * self.field + change
+        self.field.clamp_(-10., 10.)
+
+    def pick_action(self, log_probs: bool):
+        """
+        """
+        move_log_probs = self.ac_net(self.frames, self.field, "move")
+        move_probs = torch.exp(move_log_probs)
+        move_dist = torch.distributions.categorical.Categorical(move_probs)
+        move_action = move_dist.sample()
+        write_dist = self.ac_net(self.frames, self.field, "write")
+        write = write_dist.sample()
+
+        if log_probs:
+            move_log_prob = move_log_probs[move_action]
+            write_log_prob = write_dist.log_prob(write).sum()
+            return (move_action, write), (move_log_prob, write_log_prob)
+
+        return move_action, write
+
+    def show_view(self):
+        view = self.view.clone()
+        view[self.range, self.range] = 1.
+
+        plt.matshow(view.numpy(), cmap="Greys", vmin=-2., vmax=2.)
+        plt.show(block=False)
+        plt.pause(.02)
+
+    def show_move(self, direction, show_full_grid=False, show_field=False):
+
+        if isinstance(direction, str):
+            key_map = {
+                "W": 1,
+                "A": 2,
+                "S": 3,
+                "D": 0,
+                "w": 1,
+                "a": 2,
+                "s": 3,
+                "d": 0
+            }
+            direction = key_map[direction]
+
+        plt.close()
+        (reward, terminal) = self.move(direction)
+        # self.get_view()
+
+        if show_full_grid:
+            view = self.view.clone()
+            grid = self.environment.grid.clone()
+
+            view[self.range, self.range] = 1.
+            grid[tuple(self.environment.agent_point)] = 1.
+            tools.show_images(
+                [view.numpy(), grid.numpy()],
+                titles=["Agent perspective", "Maze map"]
+            )
+
+        elif show_field:
+            view = self.view.clone()
+            view[self.range, self.range] = 1.
+            fields = [.2 * self.field[i].clone().numpy()
+                      for i in range(self.field_ch)]
+
+            tools.show_images([view.numpy()] + fields)
+
+        else:
+            self.show_view()
+
+        return reward, terminal
+
+    def show_internal_field(self):
+        plt.close()
+        plt.imshow(self.internal_field[0].numpy(), vmin=-10., vmax=10.)
+        plt.show()
+        plt.pause(.001)
+
+    def play(self, show_grid=False, discount=.95):
+
+        self.show_view(get_view=True)
+
+        key_map = {
+            "W": 1,
+            "A": 2,
+            "S": 3,
+            "D": 0,
+            "w": 1,
+            "a": 2,
+            "s": 3,
+            "d": 0
+        }
+
+        t = 0
+        total_return = 0
+        terminal = False
+
+        while not terminal:
+
+            action = input("Use WASD to move (you have to push enter--sorry).")
+            try:
+                (reward, terminal) = self.show_move(key_map[action],
+                                                    show_full_grid=show_grid)
+                total_return += discount ** t * reward
+                t += 1
+
+            except KeyError:
+                print("input error")
+
+        print("END! Final return is", total_return)
+
+
+Params = namedtuple("Params",
+                    (
+                        "discount", "td_steps", "range", "field_ch",
+                        "temp_frames",
+                        "memory_coef", "global_t_max", "entropy_coef",
+                        "recorder_batch_size"))
+
+SharedQueues = namedtuple("SharedQueues",
+                          ("maze_queue", "param_queue", "glb_t_queue"))
+
+LevelRanges = namedtuple("LevelRanges",
+                         ("num_samples", "range_list"))
+
+
+class AC3Process(Agent):
+    def __init__(self,
+                 queues: SharedQueues,
+                 params: Params,
+                 level_ranges: LevelRanges = None):
+        Agent.__init__(self, params.field_ch, params.temp_frames, params.range, params.memory_coef, None)
+
+        if queues.maze_queue:
+            self.mode = "maze_queue"
+        elif level_ranges:
+            self.mode = "level_ranges"
+        else:
+            raise RuntimeError("Unable to determine maze gathering protocol.")
+
+        self.env_list = []
+        self.level_ranges = level_ranges
+        self.track = True
+
+        self.discount = params.discount
+        self.td_steps = params.td_steps
+
+        self.glb_t_max = params.global_t_max
+        self.entropy_coef = params.entropy_coef  # TODO implement entropy loss
+
+        self.maze_queue = queues.maze_queue
+        self.param_queue = queues.param_queue
+        self.glb_t_queue = queues.glb_t_queue
+
         critic_params = [
             {'params': self.ac_net.field_conv.parameters()},
             {'params': self.ac_net.temporal_conv.parameters()},
@@ -81,8 +251,7 @@ class AC3Process(object):
             {'params': self.ac_net.critic.parameters()}
         ]
         move_params = [
-            # TODO: uncomment
-            # {'params': self.ac_net.field_conv.parameters()},
+            {'params': self.ac_net.field_conv.parameters()},
             {'params': self.ac_net.temporal_conv.parameters()},
             {'params': self.ac_net.processing.parameters()},
             {'params': self.ac_net.log_pol_move.parameters()}
@@ -94,13 +263,21 @@ class AC3Process(object):
             {'params': self.ac_net.mean_generator.parameters()},
             {'params': self.ac_net.sd_generator.parameters()}
         ]
-        critic_opt = optim.RMSprop(critic_params, lr=1e-6)
-        move_opt = optim.RMSprop(move_params, lr=1e-4)
-        write_opt = optim.RMSprop(write_params, lr=1e-30)
-        self.optimizers = [critic_opt, move_opt, write_opt]
+        discriminator_params = [
+            {'params': self.ac_net.field_conv.parameters()},
+            {'params': self.ac_net.discriminator_end.parameters()}
+        ]
+        critic_opt = optim.RMSprop(critic_params, lr=2e-5)
+        move_opt = optim.RMSprop(move_params, lr=1e-5) # TODO: focus on memory
+        write_opt = optim.RMSprop(write_params, lr=1e-5)
+        discriminator_opt = optim.RMSprop(discriminator_params, lr=1e-6)
+        #self.optimizers = [critic_opt, move_opt, write_opt, discriminator_opt]
+        self.optimizers = [discriminator_opt]  # TODO revert
+        self.mem_opt_threshold = .1
         self.asynchronous_update(optimize=False)
-
         self.glb_t = 0
+
+        self.recorder = Recorder(params.recorder_batch_size)
 
         # Load the first environment and initialize self.frames and self.field.
         self.next_environment()
@@ -125,15 +302,21 @@ class AC3Process(object):
         write_log_prob_list = [None for _ in range(self.td_steps)]
 
         terminal = False
+        show = False
+        show_interval = 50000
+        show_thresh = show_interval
         while self.glb_t < self.glb_t_max and self.environment:
             global_t_increment = 0
             t_start = t
             state_list[0] = (self.frames, self.field)
 
             while t - t_start < self.td_steps and not terminal:
-                (mv_act, mv_lp), (write, write_lp) = self.pick_action()
-
-                reward, terminal = self.move(mv_act.item())
+                self.record()
+                (mv_act, write), (mv_lp, write_lp) = self.pick_action(True)
+                if show:
+                    reward, terminal = self.show_move(mv_act.item(), show_field=True)
+                else:
+                    reward, terminal = self.move(mv_act.item())
                 self.update_field(write)
 
                 if self.track:
@@ -153,8 +336,15 @@ class AC3Process(object):
 
             if terminal:
                 ret = 0.
+                self.recorder.finish_episode()
+                reward_list[t - 1 - t_start] += self.memory_test()
                 self.next_environment()
                 terminal = False
+
+                show = False
+                if t > show_thresh:
+                    show = True
+                    show_thresh += show_interval
                 if self.track:
                     print("{:6d} {:6d} {:6d} {:6d}"
                           .format(crashes, steps, exits, self.glb_t))
@@ -193,29 +383,6 @@ class AC3Process(object):
             self.change_global_time(global_t_increment)
             self.asynchronous_update(optimize=True)
 
-    def pick_action(self):
-        """
-
-        :return:  tuple
-            ((move_action, move_log_prob), (write, write_log_prob))
-            move_action is the index that determines which movement direciton
-            to select.  write is the field writing tensor.  The corresponding
-            log_probs are the log of the probability that those actions
-            would have been selected (before they were selected).
-        """
-        move_log_probs = self.ac_net(self.frames, self.field, "move")
-
-        dist = self.ac_net(self.frames, self.field, "write")
-        write = dist.sample()
-        write_log_prob = dist.log_prob(write).sum()
-
-        move_probs = torch.exp(move_log_probs)
-        move_dist = torch.distributions.categorical.Categorical(move_probs)
-        move_action = move_dist.sample()
-        move_log_prob = move_log_probs[move_action]
-
-        return (move_action, move_log_prob), (write, write_log_prob)
-
     def asynchronous_update(self, optimize: bool):
         """
         When optimize is False, this method simply loads the latest
@@ -246,6 +413,43 @@ class AC3Process(object):
         self.glb_t = t
         self.glb_t_queue.put(t)
 
+    def record(self):
+        self.recorder.save(self.frames[-1], self.field)
+
+    def memory_test(self, num_cycles=2):
+
+        extracted = self.recorder.extract()
+        if not extracted:
+            return 0.
+
+        frame_back, frame_fwd, field_fwd = extracted
+        print(field_fwd[0][0])
+
+        confidence = self.ac_net(frame_fwd, field_fwd, "test_memory")
+        rejection = 1. - self.ac_net(frame_back, field_fwd, "test_memory")
+
+        reward = (confidence[-1] + rejection[-1]) / 2.
+        reward = reward.item()
+
+        loss = -torch.log(confidence) - torch.log(rejection)
+        loss = loss.mean()
+
+        if loss > self.mem_opt_threshold:
+            loss.backward()
+
+            for _ in range(num_cycles - 1):
+                extracted = self.recorder.extract()
+                frame_back, frame_fwd, field_fwd = extracted
+
+                confidence = self.ac_net(frame_fwd, field_fwd, "test_memory")
+                rejection = 1. - self.ac_net(frame_back, field_fwd, "test_memory")
+                loss = -torch.log(confidence) - torch.log(rejection)
+                loss = loss.mean()
+                loss.backward()
+
+        print(loss.item())
+        return reward
+
     def next_environment(self):
         """
         TODO new doc
@@ -270,44 +474,6 @@ class AC3Process(object):
             self.initialize_frames()
             self.initialize_field()
 
-    def initialize_frames(self):
-        view = self.get_view()
-        view_stack = torch.stack([view for _ in range(self.num_temp_frames)])
-        self.frames = self.preprocessor(view_stack)
-
-    def initialize_field(self):
-        self.field = torch.zeros(self.field_size)
-
-    def get_view(self, noise_scale=.01):
-        # if self.view_loaded:
-        #    return self.view
-        self.view = self.environment.agent_view(self.range)
-        self.view += noise_scale * torch.randn(self.view.size())
-        self.view_loaded = True
-        return self.view
-
-    def move(self, move_index):
-        """
-        :param int move_index: an index for self.steps
-        :return: (float reward, bool terminal):
-        reward: the reward the environment returns after the action
-        terminal: True if the new state is terminal, False otherwise
-        """
-        assert self.view_loaded, "Error: AC3Process.move called before " \
-                                 "calling AC3Process.get_view."
-        step = self.steps[move_index]
-        (reward, terminal) = self.environment.move_agent(step)
-        view = self.get_view()
-        frame = self.preprocessor(view.unsqueeze(0))
-        self.frames = torch.cat((self.frames[1:], frame))
-
-        return reward, terminal
-
-    def update_field(self, change):
-        self.field = self.memory_coef * self.field + change
-        self.field.clamp_(-10., 10.)
-        return 0.  # We will later include internal rewards...
-
     def load_mazes(self):
         try:
             (min_lev, max_lev) = self.level_ranges.range_list.pop(0)
@@ -323,11 +489,11 @@ class AC3Process(object):
 
         # TODO fix this hard-coded part
         for maze in self.env_list:
-            maze.exit_reward = 1.
+            maze.exit_reward = 0. # TODO: this is because we are working on memory only right now
             maze.step_reward = 0.
             maze.crash_reward = 0.
             maze.timeout_reward = maze.crash_reward
-            maze.timeout_steps = 50
+            maze.timeout_steps = 9 # TODO: same thing--we are making the maze terminate quickly to speed the memory test
 
         return self.env_list.pop(0)
 
@@ -350,191 +516,6 @@ def get_group(lowest_lev, highest_lev):
             maze_group = pickle.load(f)
         mazes += maze_group
     return mazes
-
-
-class Agent(object):
-    def __init__(self, ac_state_dict, field_ch, num_temp_frames, ag_range, memory_coef):
-        # TODO: temp removal of field (change back the type of network)
-        self.field_ch = field_ch
-        self.num_temp_frames = num_temp_frames
-        self.range = ag_range
-        assert self.range == 5, "Currently, range must be 5."
-        self.memory_coef = memory_coef
-        self.preprocessor = networks.SensoryNetFixed()
-        self.ac_net = networks.ActorCriticNoField( self.field_ch, self.num_temp_frames)
-        self.ac_net.load_state_dict(ac_state_dict)
-
-        self.environment = None
-        width = 2 * self.range + 1
-        self.view = torch.zeros((width, width))
-        self.frames = None
-        self.field_size = (self.field_ch, 28, 28)
-        self.field = None
-
-        self.steps = [
-            np.array([0, 1]),
-            np.array([-1, 0]),
-            np.array([0, -1]),
-            np.array([1, 0])
-        ]
-
-    def episode_run(self, env=None):
-        if env:
-            self.set_environment(env)
-        terminal = False
-        while not terminal:
-            (action, _) = self.pick_action()
-            _, terminal = self.show_move(action.item())
-
-
-    def set_environment(self, env):
-        if self.environment:
-            self.environment.reset_grid()
-        self.environment = env
-        self.initialize_frames()
-        self.initialize_field()
-
-    def initialize_frames(self):
-        view = self.get_view()
-        view_stack = torch.stack([view for _ in range(self.num_temp_frames)])
-        self.frames = self.preprocessor(view_stack)
-
-    def initialize_field(self):
-        self.field = torch.zeros(self.field_size)
-
-    def get_view(self, noise_scale=.01):
-        # if self.view_loaded:
-        #    return self.view
-        self.view = self.environment.agent_view(self.range)
-        self.view += noise_scale * torch.randn(self.view.size())
-        return self.view
-
-    def move(self, move_index):
-        """
-        :param int move_index: an index for self.steps
-        :return: (float reward, bool terminal):
-        reward: the reward the environment returns after the action
-        terminal: True if the new state is terminal, False otherwise
-        """
-        step = self.steps[move_index]
-        (reward, terminal) = self.environment.move_agent(step)
-        view = self.get_view()
-        frame = self.preprocessor(view.unsqueeze(0))
-        self.frames = torch.cat((self.frames[1:], frame))
-        return reward, terminal
-
-    def update_field(self, change):
-        self.field = self.memory_coef * self.field + change
-        self.field.clamp_(-10., 10.)
-        return 0.  # We will later include internal rewards...
-
-    def pick_action(self):
-        """
-
-        :return:  tuple
-            ((move_action, move_log_prob), (write, write_log_prob))
-            move_action is the index that determines which movement direciton
-            to select.  write is the field writing tensor.  The corresponding
-            log_probs are the log of the probability that those actions
-            would have been selected (before they were selected).
-        """
-        # TODO: temp removal of field
-        # move_log_probs = self.ac_net(self.frames, self.field, "move")
-        move_log_probs = self.ac_net(self.frames, "move")  # <- remove
-        # TODO: temp removal of field
-        # dist = self.ac_net(self.frames, self.field, "write")
-        # write = dist.sample()
-        # write_log_prob = dist.log_prob(write).sum()
-
-        move_probs = torch.exp(move_log_probs)
-        move_dist = torch.distributions.categorical.Categorical(move_probs)
-        move_action = move_dist.sample()
-        move_log_prob = move_log_probs[move_action]
-
-        # TODO: temp removal of field
-        return (move_action, move_log_prob)  # , (write, write_log_prob)
-
-    def show_view(self):
-        view = self.view.clone()
-        view[self.range, self.range] = 1.
-
-        plt.matshow(view.numpy(), cmap="Greys", vmin=-2., vmax=2.)
-        plt.show(block=False)
-        plt.pause(.02)
-
-    def show_move(self, direction, show_full_grid=False):
-
-        if isinstance(direction, str):
-            key_map = {
-                "W": 1,
-                "A": 2,
-                "S": 3,
-                "D": 0,
-                "w": 1,
-                "a": 2,
-                "s": 3,
-                "d": 0
-            }
-            direction = key_map[direction]
-
-        plt.close()
-        (reward, terminal) = self.move(direction)
-        # self.get_view()
-
-        if show_full_grid:
-            view = self.view.clone()
-            grid = self.environment.grid.clone()
-
-            view[self.range, self.range] = 1.
-            grid[tuple(self.environment.agent_point)] = 1.
-            tools.show_images(
-                [view.numpy(), grid.numpy()],
-                titles=["Agent perspective", "Maze map"]
-            )
-
-        else:
-            self.show_view()
-
-        return reward, terminal
-
-    def show_internal_field(self):
-        plt.close()
-        plt.imshow(self.internal_field[0].numpy(), vmin=-10.,vmax=10.)
-        plt.show()
-        plt.pause(.001)
-
-    def play(self, show_grid=False, discount=.95):
-
-        self.show_view(get_view=True)
-
-        key_map = {
-            "W": 1,
-            "A": 2,
-            "S": 3,
-            "D": 0,
-            "w": 1,
-            "a": 2,
-            "s": 3,
-            "d": 0
-        }
-
-        t = 0
-        total_return = 0
-        terminal = False
-
-        while not terminal:
-
-            action = input("Use WASD to move (you have to push enter--sorry).")
-            try:
-                (reward, terminal) = self.show_move(key_map[action],
-                                                    show_full_grid=show_grid)
-                total_return += discount ** t * reward
-                t += 1
-
-            except KeyError:
-                print("input error")
-
-        print("END! Final return is", total_return)
 
 
 EpisodeRecord = namedtuple("EpRecord", ("frame", "field"))
@@ -572,7 +553,6 @@ class Recorder(object):
 
     def extract(self):
         if not self.batch_ready:
-            print("Recorder.extract called without enough episodes")
             return None
 
         frame_back = []
@@ -628,13 +608,14 @@ if __name__ == '__main__':
                     range=5,
                     field_ch=field_ch,
                     temp_frames=temp_fr,
-                    memory_coef=.9,
+                    memory_coef=1.,
                     global_t_max=1000000000,
-                    entropy_coef=None
+                    entropy_coef=None,
+                    recorder_batch_size=100
                     )
     queues = SharedQueues(maze_queue, param_queue, glb_t_queue)
 
-    lev_ranges = LevelRanges(1000, [(1, 1) for _ in range(15)])
+    lev_ranges = LevelRanges(3000, [(20, 20) for _ in range(15)])
 
     num_processes = 4
     processes = []
