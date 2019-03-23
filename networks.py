@@ -8,6 +8,230 @@ import torch.nn as nn
 import tools
 
 
+class ACNetDiscrete(nn.Module):
+    def __init__(self, state_size, num_hidden=64, sigmoid_critic=True):
+        super(ACNetDiscrete, self).__init__()
+
+        self.conv_temp = nn.Sequential(
+            # 2, 2, 11, 11
+            nn.Conv3d(2, 20, kernel_size=(2, 4, 4)),
+            nn.ReLU(),
+            # 20, 1, 8, 8
+            nn.MaxPool3d(kernel_size=(1, 2, 2))
+            # 20, 1, 4, 4
+        )
+
+        self.conv_single = nn.Sequential(
+            # 2, 11, 11
+            nn.Conv2d(2, 10, kernel_size=3, stride=2),
+            nn.ReLU(),
+            # 10, 5, 5
+            nn.Conv2d(10, 100, kernel_size=5)
+            # 100, 1, 1
+        )
+
+        conv_temp_ft = 20*4*4
+        single_frame_ft = 2*11*11
+        conv_single_ft = 100
+
+
+        fc1_in_ft = conv_temp_ft + single_frame_ft + conv_single_ft
+        fc2_in_ft = num_hidden + state_size
+
+        self.fc1 = nn.Sequential(
+            nn.Linear(fc1_in_ft, num_hidden),
+            nn.ReLU(),
+            nn.Dropout(.3)
+        )
+
+        self.fc2 = nn.Sequential(
+            nn.Linear(fc2_in_ft, num_hidden),
+            nn.ReLU(),
+            nn.Dropout(p=.3)
+        )
+
+        self.critic = nn.Sequential(
+            nn.Linear(num_hidden, 1),
+            nn.Sigmoid()
+        )
+        if not sigmoid_critic:
+            self.critic = nn.Linear(num_hidden, 1)
+
+        self.move_end = nn.Sequential(
+            nn.Linear(num_hidden, 4),
+            nn.LogSoftmax(dim=1)  # not the batch dimension!
+        )
+
+        self.internal_end = nn.Sequential(
+            nn.Linear(num_hidden, 3),
+            nn.LogSoftmax(dim=1)  # not the batch dimension!
+        )
+
+    def forward(self, frames, internal_state, mode):
+        """
+
+        :param frames:
+            size (batch_size (optional), 2 (time), 2 (ch), 11, 11)
+        :return:
+        """
+        if frames.dim() == 4:  # if there is no batch dimension
+            frames = frames.unsqueeze(0)
+        frames = frames.transpose(1, 2)  # make time a convolutional dimension
+        assert frames.dim() == 5, "wrong frame dimension"
+        if internal_state.dim() == 1:
+            internal_state = internal_state.unsqueeze(0)
+        assert internal_state.dim() == 2, "wrong internal state shape"
+
+        last_frame = frames.select(dim=2, index=-1)
+        last_frame_flat = last_frame.view(
+            -1, tools.num_flat_features(last_frame))
+        conv_temp_out = self.conv_temp(frames)
+        conv_single_out = self.conv_single(last_frame)
+
+        conv_temp_out = conv_temp_out.view(
+            -1, tools.num_flat_features(conv_temp_out))
+        conv_single_out = conv_single_out.view(
+            -1, tools.num_flat_features(conv_single_out))
+        fc1_in = (last_frame_flat, conv_single_out, conv_temp_out)
+        fc1_in = torch.cat(fc1_in, dim=1)
+        fc1_out = self.fc1(fc1_in)
+
+        fc2_in = torch.cat((fc1_out, internal_state), dim=1)
+        fc2_out = self.fc2(fc2_in)
+
+        if mode == "critic":
+            return self.critic(fc2_out)
+        elif mode == "move":
+            lp = self.move_end(fc2_out)
+        elif mode == "internal":
+            lp = self.internal_end(fc2_out)
+        else:
+            raise ValueError("mode not recognized")
+
+        dist = torch.distributions.Categorical(torch.exp(lp))
+        entropy = dist.entropy()
+        selection = dist.sample()
+        lp = [lp[i][selection[i]] for i in range(len(selection))]
+        lp = torch.stack(lp)
+
+        if mode == "internal":
+            selection = selection.item() - 1   # 0,1,2 -> -1,0,1
+        return selection, lp, entropy
+
+
+class ActorCriticFrameMemory(nn.Module):
+
+    def __init__(self, num_frames=40, num_hidden=100, sigmoid_critic=True):
+        super(ActorCriticFrameMemory, self).__init__()
+        assert num_frames == 40, "Currently num_frames must be 40."
+        self.num_hidden = num_hidden
+        self.num_protected_frames = 4
+
+        self.frame_conv = nn.Sequential(
+            nn.Conv3d(2, 10, kernel_size=(4, 4, 4), stride=(2, 1, 1))
+        )
+
+        self.frame_conv = nn.Sequential(
+            # 40 11 11
+            nn.Conv3d(2, 16, kernel_size=(5, 4, 4)),
+            nn.ReLU(),
+            # 36 8 8
+            nn.MaxPool3d(kernel_size=(2, 1, 1)),
+            nn.ReLU(),
+            # 18 8 8
+            nn.Conv3d(16, 32, kernel_size=(5, 3, 3)),
+            nn.ReLU(),
+            # 14 6 6
+            nn.MaxPool3d(kernel_size=(2, 2, 2)),
+            nn.ReLU()
+            # 7 3 3
+        )
+        processing_input_size = 7 * 3 * 3 * 32 + 2*11*11
+        self.fc_processing = nn.Sequential(
+            nn.Linear(processing_input_size, num_hidden),
+            nn.ReLU(),
+            nn.Dropout(p=.2)
+        )
+
+        self.critic = nn.Sequential(
+            nn.Linear(num_hidden, 1),
+            nn.Sigmoid()
+        )
+        if not sigmoid_critic:
+            self.critic = nn.Linear(num_hidden, 1)
+
+        self.move_end = nn.Sequential(
+            nn.Linear(num_hidden, 4),
+            nn.LogSoftmax(dim=1)  # not the batch dimension!
+        )
+
+        self.delete_end = nn.Sequential(
+            nn.Linear(num_hidden, num_frames-self.num_protected_frames),
+            nn.LogSoftmax(dim=1)  # not the batch dimension!
+        )
+
+        discriminator_in_ft = 2 * 11 * 11 + processing_input_size
+        self.discriminator_end = nn.Sequential(
+            nn.Linear(discriminator_in_ft, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, frames: torch.Tensor, mode: str):
+
+        if frames.dim() == 4:  # if there is no batch dimension
+            frames = frames.unsqueeze(0)
+        frames = frames.transpose(1, 2)  # make time a convolutional dimension
+        assert frames.dim() == 5, "wrong frame dimension"
+        last_frame = frames.select(dim=2, index=-1)
+        last_frame = last_frame.view(-1, tools.num_flat_features(last_frame))
+        conv_out = self.frame_conv(frames)
+        conv_out = conv_out.view(-1, tools.num_flat_features(conv_out))
+        proc_in = torch.cat((last_frame, conv_out), dim=1)
+        fc_out = self.fc_processing(proc_in)
+
+        if mode == "critic":
+            return self.critic(fc_out)
+
+        if mode == "move":
+            lp = self.move_end(fc_out)
+
+        elif mode == "delete":
+            lp = self.delete_end(fc_out)
+
+        else:
+            raise ValueError("mode not recognized")
+
+        dist = torch.distributions.Categorical(torch.exp(lp))
+        entropy = dist.entropy()
+        selection = dist.sample()
+        lp = [lp[i][selection[i]] for i in range(len(selection))]
+        lp = torch.stack(lp)
+        return selection, lp, entropy
+
+    def discriminate(self, frames, test_frame):
+        if frames.dim() == 4:  # if there is no batch dimension
+            frames = frames.unsqueeze(0)
+        if test_frame.dim() == 3:
+            test_frame = test_frame.unsqueeze(0)
+        frames = frames.transpose(1, 2)  # make time a convolutional dimension
+        assert frames.dim() == 5, "wrong frame dimension"
+
+        last_frame = frames.select(dim=2, index=-1)
+        last_frame = last_frame.view(-1, tools.num_flat_features(last_frame))
+        conv_out = self.frame_conv(frames)
+        conv_out = conv_out.view(-1, tools.num_flat_features(conv_out))
+        proc_in = torch.cat((last_frame, conv_out), dim=1)
+        fc_out = self.fc_processing(proc_in)
+
+        discriminator_input = torch.cat((fc_out, test_frame), dim=1)
+        return self.discriminator_end(discriminator_input)
+
+
+
+
+
+
+#40 -c-> 36 -> 18 -c-> 12 -> ?
 class ActorCriticNet1F(nn.Module):
     """
     Network input
@@ -665,11 +889,12 @@ if __name__ == '__main__':
     from time import time
 
     sens = SensoryNetFixed()
-    ac = ActorCriticNet1F(2,3, num_hidden=100)
-    frames = torch.rand(7, 11, 11)
+    ac = ACNetDiscrete(12)
+    frames = torch.rand(2, 11, 11)
     frames = sens(frames)
-    field = torch.rand(7,1, 28, 28)
-    out = ac(frames, field, mode="test_memory")
+
+    internal = torch.rand(12)
+    out = ac(frames, internal, mode="internal")
 
 
     def print_num_params(model):

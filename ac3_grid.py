@@ -14,28 +14,20 @@ from gridworld import BoxGame
 
 
 class Agent(object):
-    def __init__(self, field_ch, num_temp_frames, ag_range, memory_coef,
-                 ac_state_dict=None):
-        # TODO: temp removal of field (change back the type of network)
-        self.field_ch = field_ch
-        self.num_temp_frames = num_temp_frames
+    def __init__(self, internal_size, ag_range=5, ac_state_dict=None):
+        assert isinstance(internal_size, int)
+        assert ag_range == 5, "Currently, range must be 5."
+        self.internal_size = internal_size
+        self.internal_state = 0
         self.range = ag_range
-        assert self.range == 5, "Currently, range must be 5."
-        self.memory_coef = memory_coef
         self.preprocessor = networks.SensoryNetFixed()
-
-        self.ac_net = networks.ActorCriticNet1F(self.field_ch,
-                                                  self.num_temp_frames)
+        self.ac_net = networks.ACNetDiscrete(internal_size)
         if ac_state_dict:
             self.ac_net.load_state_dict(ac_state_dict)
-
         self.environment = None
         width = 2 * self.range + 1
         self.view = torch.zeros((width, width))
         self.frames = None
-        self.field_size = (self.field_ch, 28, 28)
-        self.field = None
-
         self.steps = [
             np.array([0, 1]),
             np.array([-1, 0]),
@@ -48,68 +40,69 @@ class Agent(object):
             self.set_environment(env)
         terminal = False
         while not terminal:
-            (move, write) = self.pick_action()
-            _, terminal = self.show_move(move.item())
-            self.update_field(write)
+            move, _, _ = self.pick_action()
+            self.shift_internal()
+            _, terminal = self.show_move(move)
 
     def set_environment(self, env):
         if self.environment:
             self.environment.reset_grid()
         self.environment = env
         self.initialize_frames()
-        self.initialize_field()
 
     def initialize_frames(self):
         view = self.get_view()
-        view_stack = torch.stack([view for _ in range(self.num_temp_frames)])
+        view_stack = torch.stack([view for _ in range(2)])
         self.frames = self.preprocessor(view_stack)
 
-    def initialize_field(self):
-        self.field = torch.zeros(self.field_size)
-
     def get_view(self, noise_scale=.01):
-        # if self.view_loaded:
-        #    return self.view
         self.view = self.environment.agent_view(self.range)
         self.view += noise_scale * torch.randn(self.view.size())
         return self.view
 
+    def state_vec(self):
+        vec = torch.zeros(self.internal_size)
+        vec[self.internal_state] = 1.
+        return vec
+
     def move(self, move_index):
         """
-        :param int move_index: an index for self.steps
-        :return: (float reward, bool terminal):
-        reward: the reward the environment returns after the action
-        terminal: True if the new state is terminal, False otherwise
+        :param move_index: int
+            an index for self.steps
+
+        :return: (float reward, bool terminal)
+            reward: the reward the environment returns after the action
+            terminal: True if the new state is terminal, False otherwise
         """
-        # d
-        #
         step = self.steps[move_index]
         (reward, terminal) = self.environment.move_agent(step)
         view = self.get_view()
         frame = self.preprocessor(view.unsqueeze(0))
-        self.frames = torch.cat((self.frames[1:], frame))
+        self.frames = torch.cat((self.frames[-1:], frame))
         return reward, terminal
 
-    def update_field(self, change):
-        self.field = self.memory_coef * self.field + change
-        self.field.clamp_(-10., 10.)
-
-    def pick_action(self, log_probs: bool):
+    def pick_action(self):
         """
         """
-        move_log_probs = self.ac_net(self.frames, self.field, "move")
-        move_probs = torch.exp(move_log_probs)
-        move_dist = torch.distributions.categorical.Categorical(move_probs)
-        move_action = move_dist.sample()
-        write_dist = self.ac_net(self.frames, self.field, "write")
-        write = write_dist.sample()
+        state = self.state_vec()
+        action, lp, entropy = self.ac_net(self.frames, state,
+                                          "move")
+        return action.item(), lp[0], entropy
 
-        if log_probs:
-            move_log_prob = move_log_probs[move_action]
-            write_log_prob = write_dist.log_prob(write).sum()
-            return (move_action, write), (move_log_prob, write_log_prob)
+    def shift_internal(self):
+        """
+        """
+        state = self.state_vec()
+        shift, lp, entropy = self.ac_net(self.frames, state,
+                                         "internal")
+        self.internal_state = (self.internal_state + shift) % \
+                               self.internal_size
+        return shift, lp[0], entropy
 
-        return move_action, write
+    def critic(self):
+        state = self.state_vec()
+        value = self.ac_net(self.frames, state, "critic")
+        return value
 
     def show_view(self):
         view = self.view.clone()
@@ -119,7 +112,7 @@ class Agent(object):
         plt.show(block=False)
         plt.pause(.02)
 
-    def show_move(self, direction, show_full_grid=False, show_field=False):
+    def show_move(self, direction, show_full_grid=False):
 
         if isinstance(direction, str):
             key_map = {
@@ -149,28 +142,14 @@ class Agent(object):
                 titles=["Agent perspective", "Maze map"]
             )
 
-        elif show_field:
-            view = self.view.clone()
-            view[self.range, self.range] = 1.
-            fields = [.2 * self.field[i].clone().numpy()
-                      for i in range(self.field_ch)]
-
-            tools.show_images([view.numpy()] + fields)
-
         else:
             self.show_view()
 
         return reward, terminal
 
-    def show_internal_field(self):
-        plt.close()
-        plt.imshow(self.internal_field[0].numpy(), vmin=-10., vmax=10.)
-        plt.show()
-        plt.pause(.001)
-
     def play(self, show_grid=False, discount=.95):
 
-        self.show_view(get_view=True)
+        self.show_view()
 
         key_map = {
             "W": 1,
@@ -204,90 +183,76 @@ class Agent(object):
 
 Params = namedtuple("Params",
                     (
-                        "discount", "td_steps", "range", "field_ch",
-                        "temp_frames",
-                        "memory_coef", "global_t_max", "entropy_coef",
-                        "recorder_batch_size"))
+                        "discount", "td_steps", "range", "internal_size",
+                        "global_t_max", "entropy_coef", "state_dict"))
 
 SharedQueues = namedtuple("SharedQueues",
                           ("maze_queue", "param_queue", "glb_t_queue"))
 
-LevelRanges = namedtuple("LevelRanges",
-                         ("num_samples", "range_list"))
+MazeProtocol = namedtuple("MazeProtocol",
+                          ("num_samples", "rew_dict", "range_list", "time_limit"))
 
 
 class AC3Process(Agent):
     def __init__(self,
                  queues: SharedQueues,
                  params: Params,
-                 level_ranges: LevelRanges = None):
-        Agent.__init__(self, params.field_ch, params.temp_frames, params.range, params.memory_coef, None)
+                 protocol: MazeProtocol = None):
+        Agent.__init__(self, params.internal_size,
+                       ac_state_dict=params.state_dict)
 
         if queues.maze_queue:
             self.mode = "maze_queue"
-        elif level_ranges:
-            self.mode = "level_ranges"
+        elif protocol:
+            self.mode = "maze_protocol"
         else:
             raise RuntimeError("Unable to determine maze gathering protocol.")
 
         self.env_list = []
-        self.level_ranges = level_ranges
+        self.protocol = protocol
         self.track = True
-
         self.discount = params.discount
         self.td_steps = params.td_steps
-
         self.glb_t_max = params.global_t_max
-        self.entropy_coef = params.entropy_coef  # TODO implement entropy loss
-
+        self.entropy_coef = params.entropy_coef
         self.maze_queue = queues.maze_queue
         self.param_queue = queues.param_queue
         self.glb_t_queue = queues.glb_t_queue
 
         critic_params = [
-            {'params': self.ac_net.field_conv.parameters()},
-            {'params': self.ac_net.temporal_conv.parameters()},
-            {'params': self.ac_net.processing.parameters()},
+            {'params': self.ac_net.conv_temp.parameters()},
+            {'params': self.ac_net.conv_single.parameters()},
+            {'params': self.ac_net.fc1.parameters()},
+            {'params': self.ac_net.fc2.parameters()},
             {'params': self.ac_net.critic.parameters()}
         ]
         move_params = [
-            {'params': self.ac_net.field_conv.parameters()},
-            {'params': self.ac_net.temporal_conv.parameters()},
-            {'params': self.ac_net.processing.parameters()},
-            {'params': self.ac_net.log_pol_move.parameters()}
+            {'params': self.ac_net.conv_temp.parameters()},
+            {'params': self.ac_net.conv_single.parameters()},
+            {'params': self.ac_net.fc1.parameters()},
+            {'params': self.ac_net.fc2.parameters()},
+            {'params': self.ac_net.move_end.parameters()}
         ]
-        write_params = [
-            {'params': self.ac_net.field_conv.parameters()},
-            {'params': self.ac_net.temporal_conv.parameters()},
-            {'params': self.ac_net.processing.parameters()},
-            {'params': self.ac_net.mean_generator.parameters()},
-            {'params': self.ac_net.sd_generator.parameters()}
+        int_params = [
+            {'params': self.ac_net.conv_temp.parameters()},
+            {'params': self.ac_net.conv_single.parameters()},
+            {'params': self.ac_net.fc1.parameters()},
+            {'params': self.ac_net.fc2.parameters()},
+            {'params': self.ac_net.internal_end.parameters()}
         ]
-        discriminator_params = [
-            {'params': self.ac_net.field_conv.parameters()},
-            {'params': self.ac_net.discriminator_end.parameters()}
-        ]
-        critic_opt = optim.RMSprop(critic_params, lr=2e-5)
-        move_opt = optim.RMSprop(move_params, lr=1e-5) # TODO: focus on memory
-        write_opt = optim.RMSprop(write_params, lr=1e-5)
-        discriminator_opt = optim.RMSprop(discriminator_params, lr=1e-6)
-        #self.optimizers = [critic_opt, move_opt, write_opt, discriminator_opt]
-        self.optimizers = [discriminator_opt]  # TODO revert
-        self.mem_opt_threshold = .1
+        critic_opt = optim.RMSprop(critic_params, lr=1e-5)
+        move_opt = optim.RMSprop(move_params, lr=1e-4, momentum=.99)
+        int_opt = optim.RMSprop(int_params, lr=1e-5)
+        self.optimizers = [critic_opt, move_opt, int_opt]
+
         self.asynchronous_update(optimize=False)
         self.glb_t = 0
-
-        self.recorder = Recorder(params.recorder_batch_size)
-
-        # Load the first environment and initialize self.frames and self.field.
+        # Load the first environment and initialize self.frames.
         self.next_environment()
 
     def run(self):
 
         t = 1
-        # move_action_list = torch.zeros(self.td_steps, dtype=torch.int)
-        # write_action_list = torch.zeros(
-        #    torch.Size(self.td_steps) + self.field_size)
         if self.track:
             crash_rew = 0.
             step_rew = 0.
@@ -298,8 +263,11 @@ class AC3Process(Agent):
 
         reward_list = torch.zeros(self.td_steps)
         state_list = [None for _ in range(self.td_steps + 1)]
+        int_state_list = [None for _ in range(self.td_steps + 1)]
         move_log_prob_list = [None for _ in range(self.td_steps)]
-        write_log_prob_list = [None for _ in range(self.td_steps)]
+        int_log_prob_list = [None for _ in range(self.td_steps)]
+        move_ent_list = [None for _ in range(self.td_steps)]
+        int_ent_list = [None for _ in range(self.td_steps)]
 
         terminal = False
         show = False
@@ -308,16 +276,17 @@ class AC3Process(Agent):
         while self.glb_t < self.glb_t_max and self.environment:
             global_t_increment = 0
             t_start = t
-            state_list[0] = (self.frames, self.field)
+            state_list[0] = self.frames.clone()
+            int_state_list[0] = self.state_vec()
 
             while t - t_start < self.td_steps and not terminal:
-                self.record()
-                (mv_act, write), (mv_lp, write_lp) = self.pick_action(True)
+
+                mv_act, mv_lp, mv_ent = self.pick_action()
+                shift, int_lp, int_ent = self.shift_internal()
                 if show:
-                    reward, terminal = self.show_move(mv_act.item(), show_field=True)
+                    reward, terminal = self.show_move(mv_act)
                 else:
-                    reward, terminal = self.move(mv_act.item())
-                self.update_field(write)
+                    reward, terminal = self.move(mv_act)
 
                 if self.track:
                     if reward == crash_rew:
@@ -329,15 +298,17 @@ class AC3Process(Agent):
 
                 reward_list[t - t_start] = reward
                 move_log_prob_list[t - t_start] = mv_lp
-                write_log_prob_list[t - t_start] = write_lp
+                int_log_prob_list[t - t_start] = int_lp
+                move_ent_list[t - t_start] = mv_ent
+                int_ent_list[t - t_start] = int_ent
+
                 t += 1
                 global_t_increment += 1
-                state_list[t - t_start] = (self.frames, self.field)
+                state_list[t - t_start] = self.frames.clone()
+                int_state_list[t - t_start] = self.state_vec()
 
             if terminal:
                 ret = 0.
-                self.recorder.finish_episode()
-                reward_list[t - 1 - t_start] += self.memory_test()
                 self.next_environment()
                 terminal = False
 
@@ -352,25 +323,27 @@ class AC3Process(Agent):
                     steps = 0
                     exits = 0
             else:
-                ret = self.ac_net(
-                    self.frames, self.field, mode="critic").detach()
+                ret = self.critic().detach()
 
             for i in reversed(range(t_start, t)):
                 ret = reward_list[i - t_start] + self.discount * ret
-                (frames, field) = state_list[i - t_start]
-                # move_action = move_action_list[i - t_start]
-                # write_action = write_action_list[i - t_start]
+                frames = state_list[i - t_start]
+                internal_state = int_state_list[i - t_start]
 
                 move_lp = move_log_prob_list[i - t_start]
-                write_lp = write_log_prob_list[i - t_start]
+                int_lp = int_log_prob_list[i - t_start]
+                move_ent = move_ent_list[i - t_start]
+                int_ent = int_ent_list[i - t_start]
 
-                value = self.ac_net(frames, field, "critic")
+                value = self.ac_net(frames, internal_state, "critic")
 
                 move_loss = -move_lp * (ret - value.detach())
+                move_loss += -self.entropy_coef * move_ent
                 move_loss.backward()
 
-                write_loss = -write_lp * (ret - value.detach())
-                write_loss.backward()
+                int_loss = -int_lp * (ret - value.detach())
+                int_loss += -self.entropy_coef * int_ent
+                int_loss.backward()
 
                 value_loss = (ret - value) ** 2
                 value_loss.backward()
@@ -413,6 +386,7 @@ class AC3Process(Agent):
         self.glb_t = t
         self.glb_t_queue.put(t)
 
+    # TODO: fix recorder, etc
     def record(self):
         self.recorder.save(self.frames[-1], self.field)
 
@@ -452,7 +426,6 @@ class AC3Process(Agent):
 
     def next_environment(self):
         """
-        TODO new doc
         """
         if self.environment:
             self.environment.reset_grid()
@@ -461,7 +434,7 @@ class AC3Process(Agent):
                 self.environment = None
             else:
                 self.environment = self.maze_queue.get()
-        elif self.mode == "level_ranges":
+        elif self.mode == "maze_protocol":
             try:
                 self.environment = self.env_list.pop(0)
             except IndexError:
@@ -472,43 +445,49 @@ class AC3Process(Agent):
 
         if self.environment:
             self.initialize_frames()
-            self.initialize_field()
+            self.internal_state = 0
 
     def load_mazes(self):
+        print("load_mazes called with current remaining range_list")
+        print(self.protocol.range_list)
+
+        mazes = []
+        valid_levels = [1, 2, 3, 4, 5, 6, 7, 8, 9, 20]
         try:
-            (min_lev, max_lev) = self.level_ranges.range_list.pop(0)
+            (min_lev, max_lev) = self.protocol.range_list.pop(0)
         except IndexError:
             return None
         for lev in range(min_lev, max_lev + 1):
-            print("\n\n***********************\n\nloading level ", lev, "\n\n")
-            filename = "level_" + str(lev) + ".dat"
-            with open(filename, "rb") as f:
-                maze_group = pickle.load(f)
-        random.shuffle(maze_group)
-        self.env_list = maze_group[:self.level_ranges.num_samples]
+            if lev in valid_levels:
+                print("\n\n***********************\n\nloading level ", lev, "\n\n")
+                filename = "level_" + str(lev) + ".dat"
+                with open(filename, "rb") as f:
+                    maze_group = pickle.load(f)
+                for maze in maze_group:
+                    maze.timeout_steps = self.protocol.time_limit[lev]
+                mazes += maze_group
 
-        # TODO fix this hard-coded part
+        random.shuffle(mazes)
+        self.env_list = mazes[:self.protocol.num_samples]
+
         for maze in self.env_list:
-            maze.exit_reward = 0. # TODO: this is because we are working on memory only right now
-            maze.step_reward = 0.
-            maze.crash_reward = 0.
-            maze.timeout_reward = maze.crash_reward
-            maze.timeout_steps = 9 # TODO: same thing--we are making the maze terminate quickly to speed the memory test
+            maze.exit_reward = self.protocol.rew_dict["exit"]
+            maze.step_reward = self.protocol.rew_dict["step"]
+            maze.crash_reward = self.protocol.rew_dict["crash"]
+            maze.timeout_reward = self.protocol.rew_dict["timeout"]
 
         return self.env_list.pop(0)
 
-
-def activate(queues, params, level_ranges):
+def activate(queues, params, protocol):
     p_name = current_process().name
     print("Activating an actor-critic from {0}.".format(p_name))
-    single_ac = AC3Process(queues, params, level_ranges)
-    # todo testing
+    single_ac = AC3Process(queues, params, protocol)
     single_ac.run()
     print("Run in {0} complete.".format(p_name))
 
-
 def get_group(lowest_lev, highest_lev):
     mazes = []
+    valid_levels = [1,2,3,4,5,6,7,8,9,20]
     for lev in range(lowest_lev, highest_lev + 1):
         print("loading level ", lev)
         filename = "level_" + str(lev) + ".dat"
@@ -591,10 +570,8 @@ class Recorder(object):
 if __name__ == '__main__':
     set_start_method('spawn')
 
-    field_ch = 1
-    temp_fr = 2
-    # TODO: temp removal of field
-    ac_net = networks.ActorCriticNet1F(field_ch, temp_fr, num_hidden=100)
+    num_internal = 8
+    ac_net = networks.ACNetDiscrete(state_size=num_internal)
 
     maze_queue = None  # level ranges mode
     param_queue = Queue()
@@ -606,21 +583,24 @@ if __name__ == '__main__':
     params = Params(discount=1.,
                     td_steps=5,
                     range=5,
-                    field_ch=field_ch,
-                    temp_frames=temp_fr,
-                    memory_coef=1.,
+                    internal_size=num_internal,
                     global_t_max=1000000000,
-                    entropy_coef=None,
-                    recorder_batch_size=100
+                    entropy_coef=0.002,
+                    state_dict=None
                     )
     queues = SharedQueues(maze_queue, param_queue, glb_t_queue)
 
-    lev_ranges = LevelRanges(3000, [(20, 20) for _ in range(15)])
+    num_samples = 2000
+    rew_dict = {"exit": 1., "step": 0., "crash": 0., "timeout": 0.}
+    lev_ranges = [(1, 9) for _ in range(50)]
+    time_limit = [149 for _ in range(5)] + [299 for _ in range(10)]
+
+    protocol = MazeProtocol(num_samples, rew_dict, lev_ranges, time_limit)
 
     num_processes = 4
     processes = []
     for _ in range(num_processes):
-        proc = Process(target=activate, args=(queues, params, lev_ranges))
+        proc = Process(target=activate, args=(queues, params, protocol))
         processes.append(proc)
     for p in processes:
         p.start()
